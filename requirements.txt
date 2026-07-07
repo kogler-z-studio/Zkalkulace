@@ -2,4 +2,3 @@ streamlit
 ezdxf
 pdfplumber
 matplotlib
-shapely
