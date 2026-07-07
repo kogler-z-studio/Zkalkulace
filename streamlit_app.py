@@ -4,155 +4,219 @@ import pdfplumber
 import math
 import tempfile
 import os
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from shapely.geometry import Polygon, box
+from shapely.ops import unary_union
 
-# --- POMOCNÉ FUNKCE PRO VÝPOČET GEOMETRIE ---
+# --- DEFINICE FORMÁTŮ PAPÍRU / ARCHŮ (v mm) ---
+FORMATY_ARCHU = {
+    "Vlastní (zadám v mm)": None,
+    "A4 (210 x 297 mm)": (210, 297),
+    "A3 (297 x 420 mm)": (297, 420),
+    "A2 (420 x 594 mm)": (420, 594),
+    "A1 (594 x 841 mm)": (594, 841),
+    "A0 (841 x 1189 mm)": (841, 1189),
+    "B2 (500 x 707 mm)": (500, 707),
+    "B1 (707 x 1000 mm)": (707, 1000),
+    "B0 (1000 x 1414 mm)": (1000, 1414),
+}
 
-def spocitej_delku_dxf_struktury(doc):
-    """Projde modelspace DXF dokumentu a spočítá délku všech vektorů."""
+# --- GEOMETRICKÉ FUNKCE ---
+
+def ziskej_rozmery_a_delku_dxf(doc):
+    """Vrátí celkovou délku hran v metrech a bounding box (šířka, výška v mm) dílce."""
     msp = doc.modelspace()
     celkova_delka_mm = 0.0
+    x_coords, y_coords = [], []
 
     for entity in msp:
-        # Úsečky
         if entity.dxftype() == 'LINE':
             celkova_delka_mm += math.dist(entity.dxf.start, entity.dxf.end)
-        
-        # Kružnice
+            x_coords.extend([entity.dxf.start.x, entity.dxf.end.x])
+            y_coords.extend([entity.dxf.start.y, entity.dxf.end.y])
         elif entity.dxftype() == 'CIRCLE':
             celkova_delka_mm += 2 * math.pi * entity.dxf.radius
-        
-        # Oblouky
+            x_coords.extend([entity.dxf.center.x - entity.dxf.radius, entity.dxf.center.x + entity.dxf.radius])
+            y_coords.extend([entity.dxf.center.y - entity.dxf.radius, entity.dxf.center.y + entity.dxf.radius])
         elif entity.dxftype() == 'ARC':
             r = entity.dxf.radius
-            start_w = entity.dxf.start_angle
-            end_w = entity.dxf.end_angle
-            if end_w < start_w:
-                end_w += 360
-            uhel = end_w - start_w
+            uhel = (entity.dxf.end_angle - entity.dxf.start_angle) % 360
             celkova_delka_mm += (2 * math.pi * r) * (uhel / 360.0)
-        
-        # Složité křivky (Polylines)
+            x_coords.extend([entity.dxf.center.x - r, entity.dxf.center.x + r])
+            y_coords.extend([entity.dxf.center.y - r, entity.dxf.center.y + r])
         elif entity.dxftype() in ('LWPOLYLINE', 'POLYLINE'):
             points = entity.get_points() if entity.dxftype() == 'POLYLINE' else entity.vertices()
             pts = [p for p in points]
             for i in range(len(pts) - 1):
                 celkova_delka_mm += math.dist(pts[i][:2], pts[i+1][:2])
-            if entity.closed:
+                x_coords.append(pts[i][0])
+                y_coords.append(pts[i][1])
+            if pts:
+                x_coords.append(pts[-1][0])
+                y_coords.append(pts[-1][1])
+            if entity.closed and pts:
                 celkova_delka_mm += math.dist(pts[-1][:2], pts[0][:2])
 
-    return celkova_delka_mm / 1000.0  # Převod na metry
+    if x_coords and y_coords:
+        sirka = max(x_coords) - min(x_coords)
+        vyska = max(y_coords) - min(y_coords)
+        return celkova_delka_mm / 1000.0, sirka, vyska
+    return 0.0, 0.0, 0.0
 
-
-def zpracuj_pdf_vektory(file_bytes, dpi_meritko):
-    """Vytáhne z vektorového PDF délky všech nakreslených čar a geometrických cest."""
-    celkova_delka_pt = 0.0
+def hnezdni_dilce(sirka_archu, vyska_archu, sirka_dilce, vyska_dilce, celkovy_pocet_ks, okraj=5):
+    """Algoritmus pro pravoúhlý nesting dílců na archy."""
+    w_dil_okraj = sirka_dilce + okraj
+    h_dil_okraj = vyska_dilce + okraj
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
+    # Kolik se jich vejde na jeden arch (zkusíme variantu na výšku i na šířku)
+    stlpce_v1 = int((sirka_archu - okraj) // w_dil_okraj)
+    radky_v1 = int((vyska_archu - okraj) // h_dil_okraj)
+    ks_na_arch_v1 = max(0, stlpce_v1 * radky_v1)
+    
+    # Otočení dílce o 90 stupňů pro optimalizaci
+    stlpce_v2 = int((sirka_archu - okraj) // h_dil_okraj)
+    radky_v2 = int((vyska_archu - okraj) // w_dil_okraj)
+    ks_na_arch_v2 = max(0, stlpce_v2 * radky_v2)
+    
+    # Vybereme lepší rotaci
+    if ks_na_arch_v2 > ks_na_arch_v1:
+        w_d, h_d = h_dil_okraj, w_dil_okraj
+        w_vykres, h_vykres = vyska_dilce, sirka_dilce
+        ks_na_arch = ks_na_arch_v2
+        stlpce, radky = stlpce_v2, radky_v2
+    else:
+        w_d, h_d = w_dil_okraj, h_dil_okraj
+        w_vykres, h_vykres = sirka_dilce, vyska_dilce
+        ks_na_arch = ks_na_arch_v1
+        stlpce, radky = stlpce_v1, radky_v1
 
-    try:
-        with pdfplumber.open(tmp_path) as pdf:
-            for page in pdf.pages:
-                # 1. Získání přímých čar (lines)
-                for line in page.lines:
-                    x0, y0 = float(line['x0']), float(line['y0'])
-                    x1, y1 = float(line['x1']), float(line['y1'])
-                    celkova_delka_pt += math.hypot(x1 - x0, y1 - y0)
-                
-                # 2. Získání obdélníků / uzavřených cest (rects)
-                for rect in page.rects:
-                    w = float(rect['width'])
-                    h = float(rect['height'])
-                    celkova_delka_pt += (2 * w + 2 * h)
-                    
-                # 3. Získání komplexních křivek (curves/paths)
-                for curve in page.curves:
-                    x0, y0 = float(curve['x0']), float(curve['y0'])
-                    x1, y1 = float(curve['x1']), float(curve['y1'])
-                    celkova_delka_pt += math.hypot(x1 - x0, y1 - y0)
-        
-        os.unlink(tmp_path)
-        # PDF standardně používá body (1 bod = 1/72 palce = 0.3528 mm)
-        # Použijeme uživatelské měřítko pro převod bodů přímo na reálné metry rozvinu
-        delka_m = (celkova_delka_pt * 0.3528 / 1000.0) * dpi_meritko
-        return delka_m
-    except Exception as e:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        st.error(f"Chyba při analýze PDF: {e}. Ujistěte se, že jde o vektorové PDF z CADu, ne naskenovaný obrázek.")
-        return None
+    if ks_na_arch == 0:
+        return 0, 0, [], 0.0
+
+    potrebne_archy = math.ceil(celkovy_pocet_ks / ks_na_arch)
+    
+    # Generování souřadnic pro náhled prvního archu
+    souradnice_na_archu = []
+    vlozeno = 0
+    for r in range(radky):
+        for s in range(stlpce):
+            if vlozeno < celkovy_pocet_ks:
+                x = okraj + s * w_d
+                y = okraj + r * h_d
+                souradnice_na_archu.append((x, y, w_vykres, h_vykres))
+                vlozeno += 1
+
+    # Výpočet využití plochy na 1 archu
+    plocha_archu = sirka_archu * vyska_archu
+    plocha_dilců_na_archu = min(ks_na_arch, celkovy_pocet_ks) * (sirka_dilce * vyska_dilce)
+    vyuziti_procento = (plocha_dilců_na_archu / plocha_archu) * 100
+
+    return ks_na_arch, potrebne_archy, souradnice_na_archu, vyuziti_procento
 
 # --- MAIN STREAMLIT APP ---
 
-st.set_page_config(page_title="Profi Výrobní Kalkulačka", layout="centered")
-st.title("📐 Multi-formátový kalkulátor z rozvinů")
-st.write("Podporované formáty: **.dxf, .dwg (textové verze), .pdf (vektorové výkresy)**")
+st.set_page_config(page_title="Výrobní Nesting Kalkulátor", layout="wide")
+st.title("📦 Výrobní kalkulátor s Nestingem (skládáním na arch)")
 
-# Výběr souboru
-uploaded_file = st.file_uploader("Nahrajte výkres rozvinu", type=["dxf", "dwg", "pdf"])
+# Sidebar nastavení
+st.sidebar.header("⚙️ Výrobní parametry")
+celkovy_pocet_ks = st.sidebar.number_input("Požadovaný počet kusů výrobku (ks)", value=50, min_value=1, step=5)
+okraj_mezi_dilci = st.sidebar.number_input("Min. mezera mezi dílci / okraj (mm)", value=5, min_value=0, step=1)
 
-# Boční panel nastavení
-st.sidebar.header("⚙️ Nastavení nákladů")
+st.sidebar.subheader("📐 Rozměry polotovaru / archu")
+vybrany_format = st.sidebar.selectbox("Vyberte formát archu", list(FORMATY_ARCHU.keys()))
+
+if vybrany_format == "Vlastní (zadám v mm)":
+    sirka_archu = st.sidebar.number_input("Šířka archu (mm)", value=1000, min_value=1)
+    vyska_archu = st.sidebar.number_input("Výška archu (mm)", value=1000, min_value=1)
+else:
+    sirka_archu, vyska_archu = FORMATY_ARCHU[vybrany_format]
+    st.sidebar.disabled = True
+    st.sidebar.write(f"Rozměr: {sirka_archu} x {vyska_archu} mm")
+
+st.sidebar.subheader("💰 Ekonomika")
+cena_archu = st.sidebar.number_input("Nákupní cena jednoho archu (Kč)", value=150.0, step=10.0)
 rychlost_stroje = st.sidebar.number_input("Rychlost řezu (mm/min)", value=2000, step=100)
 cena_stroj_hod = st.sidebar.number_input("Sazba stroje (Kč/hod)", value=450, step=10)
-cena_prace_hod = st.sidebar.number_input("Sazba operátora (Kč/hod)", value=350, step=10)
-marze_procento = st.sidebar.number_input("Požadovaná marže (%)", value=20, step=5)
 
-# Specifické nastavení pro PDF měřítko
-pdf_meritko = 1.0
-if uploaded_file and uploaded_file.name.endswith('.pdf'):
-    st.info("💡 U PDF výkresů je potřeba zadat koeficient měřítka exportu (jak moc je výkres zmenšen oproti realitě 1:1).")
-    pdf_meritko = st.number_input("Koeficient měřítka PDF (např. pokud je výkres 1:10, zadejte 10)", value=1.0, step=0.1)
+# Hlavní plocha pro nahrání
+uploaded_file = st.file_uploader("Nahrajte výkres rozvinu (.dxf)", type=["dxf"])
 
 if uploaded_file is not None:
     bytes_data = uploaded_file.getvalue()
-    file_extension = uploaded_file.name.split('.')[-1].lower()
-    delka_rezu_m = None
     
-    with st.spinner("Chroustám geometrii a počítám délku vektorů..."):
-        if file_extension in ('dxf', 'dwg'):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp:
-                tmp.write(bytes_data)
-                tmp_path = tmp.name
-            try:
-                # ezdxf umí načíst nativní DXF a novější verze umí parsovat i DWG schémata
-                doc = ezdxf.readfile(tmp_path)
-                delka_rezu_m = spocitej_delku_dxf_struktury(doc)
-                os.unlink(tmp_path)
-            except Exception as e:
-                os.unlink(tmp_path)
-                st.error(f"Chyba formátu CAD souboru: {e}. Pokud jde o staré binární DWG, uložte ho v CADu jako verzi DXF 2010 nebo novější.")
-        
-        elif file_extension == 'pdf':
-            delka_rezu_m = zpracuj_pdf_vektory(bytes_data, pdf_meritko)
+    with st.spinner("Analyzuji geometrii rozvinu..."):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
+            tmp.write(bytes_data)
+            tmp_path = tmp.name
+        try:
+            doc = ezdxf.readfile(tmp_path)
+            delka_m, sirka_dilce, vyska_dilce = ziskej_rozmery_a_delku_dxf(doc)
+            os.unlink(tmp_path)
+        except Exception as e:
+            os.unlink(tmp_path)
+            st.error(f"Chyba při zpracování DXF: {e}")
+            delka_m = 0
 
-    # VÝSLEDKY A KALKULACE
-    if delka_rezu_m and delka_rezu_m > 0:
-        delka_rezu_mm = delka_rezu_m * 1000
+    if delka_m > 0:
+        # Spuštění Nesting algoritmu
+        ks_na_arch, potrebne_archy, souradnice, vyuziti_procento = hnezdni_dilce(
+            sirka_archu, vyska_archu, sirka_dilce, vyska_dilce, celkovy_pocet_ks, okraj_mezi_dilci
+        )
         
-        # Výpočet času řezu
-        cas_v_minutach = delka_rezu_mm / rychlost_stroje
-        cas_v_hodinach = cas_v_minutach / 60
+        # --- ZOBRAZENÍ VÝSLEDKŮ ---
+        st.header("📊 Výrobní a materiálová bilance")
         
-        # Ekonomika
-        naklady_stroj = cas_v_hodinach * cena_stroj_hod
-        naklady_prace = cas_v_hodinach * cena_prace_hod
-        naklady_celkem = naklady_stroj + naklady_prace
-        cena_s_marzi = naklady_celkem * (1 + (marze_procento / 100))
-        
-        st.success("Vektory úspěšně spočteny!")
-        
-        col1, col2 = st.columns(2)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Celková délka vektorů", f"{delka_rezu_m:.2f} m")
-            st.metric("Čas zpracování strojem", f"{cas_v_minutach:.2f} min")
+            st.metric("Rozměr jednoho dílce", f"{sirka_dilce:.1f} x {vyska_dilce:.1f} mm")
+            st.metric("Délka obvodu/vektorů", f"{delka_m:.2f} m / ks")
         with col2:
-            st.metric("Interní výrobní náklady", f"{naklady_celkem:.2f} Kč")
-            st.metric("Výsledná cena pro zákazníka", f"{cena_s_marzi:.2f} Kč", delta=f"Marže {marze_procento}%")
+            st.metric("Kusů na jeden arch", f"{ks_na_arch} ks / arch")
+            st.metric("Potřebný počet archů", f"{potrebnep_archy if ks_na_arch > 0 else 0} ks")
+        with col3:
+            st.metric("Využití plochy archu", f"{vyuziti_procento:.1f} %")
+            st.metric("Odpad materiálu", f"{100 - vyuziti_procento:.1f} %")
+        with col4:
+            if ks_na_arch > 0:
+                celkovy_cas_min = (delka_m * 1000 * celkovy_pocet_ks) / rrychlost_stroje
+                cena_mat_celkem = potrebne_archy * cena_archu
+                cena_stroj_celkem = (celkovy_cas_min / 60) * cena_stroj_hod
+                cena_vyroby_celkem = cena_mat_celkem + cena_stroj_celkem
+                
+                st.metric("Celkový čas řezání", f"{celkovy_cas_min:.1f} min")
+                st.metric("Celková odhadovaná cena", f"{cena_vyroby_celkem:.2f} Kč")
+            else:
+                st.metric("Celkový čas řezání", "N/A")
+
+        if ks_na_arch == 0:
+            st.error("❌ Rozměr dílce (včetně okrajů) je větší než vybraný formát archu! Zvolte větší arch nebo zadejte vlastní rozměry.")
+        else:
+            # --- VYKRESLENÍ NÁHLEDU (NESTING) ---
+            st.header("🗺️ Grafický náhled rozložení (Nesting na 1. archu)")
             
-        with st.expander("🔍 Detail kalkulační matice"):
-            st.write(f"**Náklady na stroj (odpisy, energie):** {naklady_stroj:.2f} Kč")
-            st.write(f"**Lidská práce (manipulace/řez):** {naklady_prace:.2f} Kč")
-    else:
-        st.warning("V souboru nebyly nalezeny žádné měřitelné vektory. Ujistěte se, že výkres neobsahuje pouze vložený rastrový obrázek.")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            # Vykreslení archu
+            arch_patch = patches.Rectangle((0, 0), sirka_archu, vyska_archu, linewidth=2, edgecolor='black', facecolor='#f0f2f6', label='Arch polotovaru')
+            ax.add_patch(arch_patch)
+            
+            # Vykreslení jednotlivých dílců (obálek)
+            for i, (x, y, w, h) in enumerate(souradnice):
+                # První dílec zvýrazníme, ostatní jsou běžné
+                barva = '#ff4b4b' if i == 0 else '#1f77b4'
+                dil_patch = patches.Rectangle((x, y), w, h, linewidth=1, edgecolor='white', facecolor=barva, alpha=0.7)
+                ax.add_patch(dil_patch)
+                # Přidání čísla dílce pro přehlednost
+                ax.text(x + w/2, y + h/2, str(i+1), color='white', ha='center', va='center', fontsize=8, fontweight='bold')
+            
+            # Nastavení grafu
+            ax.set_xlim(-50, sirka_archu + 50)
+            ax.set_ylim(-50, vyska_archu + 50)
+            ax.set_aspect('equal', adjustable='box')
+            plt.title(f"Schéma osazení archu (Zobrazeno {len(souradnice)} z {celkovy_pocet_ks} ks)")
+            plt.xlabel("mm")
+            plt.ylabel("mm")
+            ax.grid(True, linestyle=':', alpha=0.6)
+            
+            st.pyplot(fig)
